@@ -1,164 +1,170 @@
 import numpy as np
-from trace_generation import *
+from trace_generation import compute_coeffs, message_to_bits
 from keras.models import Sequential
 from keras.layers import Dense, BatchNormalization, ReLU, Input
-from keras.callbacks import EarlyStopping
+from keras.metrics import BinaryAccuracy
 from keras.backend import clear_session
+from keras.callbacks import Callback
 
-# ----------------------------
-# Data Generation Functions
-# ----------------------------
+class StopOnThreshold(Callback):
+    def __init__(self, monitor='val_accuracy', threshold=0.80):
+        super().__init__()
+        self.monitor   = monitor
+        self.threshold = threshold
 
-def create_samples_from_messages(messages, N_per_message=1000, sigma=0):
-    samples = []
-    labels  = []
+    def on_epoch_end(self, epoch, logs=None):
+        val = logs.get(self.monitor)
+        if val is not None and val >= self.threshold:
+            self.model.stop_training = True
+
+def get_parameters_real():
+    try:
+        file_path    = (input("ETS file [kyber_poly_from_msg_d2_impREGULAR_t0.ets]: ")
+                        or "kyber_poly_from_msg_d2_impREGULAR_t0.ets")
+        k            = int(input("Samples per byte (k)  ➜  window radius [304]: ") or 304)
+        test_ratio   = float(input("Test split ratio [0.2]: ") or 0.2)
+        num_bytes = int(input("Number of bytes to train [default 16]: ") or 16)
+        epochs       = int(input("Training epochs [700]: ") or 700)
+        batch_size   = int(input("Batch size [1024]: ") or 1024)
+        val_split    = float(input("Validation split (train) [0.2]: ") or 0.2)
+        results_file = input("Results file [results.txt]: ") or "results.txt"
+    except ValueError as e:
+        print("Invalid input ->", e);  exit(1)
+
+    return (file_path, k, test_ratio, num_bytes,
+            epochs, batch_size, val_split, results_file)
+
+def get_parameters():
+    """Prompt user for configuration parameters with sensible defaults."""
+    try:
+        sigma = float(input("Noise level (sigma) [default 1.0]: ") or 1.0)
+        k = int(input("Samples per bit (k) [default 20]: ") or 20)
+        num_messages_train = int(input("Number of training messages [default 8000]: ") or 8000)
+        N_per_message_train = int(input("Traces per training message [default 1]: ") or 1)
+        num_messages_test = int(input("Number of test messages [default 2000]: ") or 2000)
+        N_per_message_test = int(input("Traces per test message [default 1]: ") or 1)
+        num_bytes = int(input("Number of bytes to train [default 16]: ") or 16)
+        epochs = int(input("Training epochs [default 100]: ") or 100)
+        batch_size = int(input("Batch size [default 4096]: ") or 4096)
+        validation_split = float(input("Validation split ratio [default 0.2]: ") or 0.2)
+        results_file = input("Results file path [default results.txt]: ") or "results.txt"
+    except ValueError as e:
+        print("Invalid input:", e)
+        exit(1)
+    return sigma, k, num_messages_train, N_per_message_train, num_messages_test, N_per_message_test, num_bytes, epochs, batch_size, validation_split, results_file
+
+
+def generate_random_messages(count):
+    return [np.random.randint(0, 256, size=32, dtype='int32') for _ in range(count)]
+
+
+def create_samples_from_messages(messages, N_per_message, sigma, k):
+    """Generate side-channel traces and labels from a list of messages."""
+    samples, labels = [], []
     for message in messages:
-        # Convert the 32-byte message into a 256-bit vector (LSB-first)
-        message_bits = message_to_bits(message)
+        bits = message_to_bits(message)
         for _ in range(N_per_message):
-            # Generate a random mask for this trace
-            mask = np.random.randint(low=0, high=256, size=32, dtype='int32')
+            mask = np.random.randint(0, 256, size=32, dtype='int32')
             share0 = mask
-            share1 = mask ^ message  # XOR to combine mask and message
-            # Compute the corresponding coefficients (trace) for each share
-            samples0 = compute_coeffs(share0, sigma=sigma, k=9)
-            samples1 = compute_coeffs(share1, sigma=sigma, k=9)
-            # Concatenate the two parts into one sample
-            sample = np.concatenate((samples0, samples1))
-            samples.append(sample)
-            labels.append(message_bits)
+            share1 = mask ^ message
+            s0 = compute_coeffs(share0, sigma=sigma, k=k)
+            s1 = compute_coeffs(share1, sigma=sigma, k=k)
+            samples.append(np.concatenate((s0, s1)))
+            labels.append(bits)
     return np.array(samples), np.array(labels)
 
-# ----------------------------
-# Parameters (Adjust as Needed)
-# ----------------------------
 
-sigma = 0  # Noise level
+def build_and_train_models(X, y, s0_k, s1_k, epochs, batch_size, validation_split, num_bytes, omega=6):
+    models = []
+    stopper = StopOnThreshold('val_accuracy', 1.0)
+    for byte_idx in range(num_bytes):
+        start0 = byte_idx * s0_k
+        end0 = start0 + s0_k
+        start1 = byte_idx * s1_k
+        end1 = start1 + s1_k
+        for bit_idx in range(8):
+            print(f"Training model for bit {byte_idx*8+bit_idx}")
+            x_bit = X[:, start1:end1]
+            y_bit = y[:, byte_idx*8+bit_idx].reshape(-1, 1)
+            clear_session()
+            model = Sequential([
+                Input(shape=(x_bit.shape[1],)),
+                Dense(32*(omega+1), use_bias=False), BatchNormalization(), ReLU(), 
+                Dense(2**(omega+4), use_bias=False), BatchNormalization(), ReLU(),
+                Dense(2**(omega+3), use_bias=False), BatchNormalization(), ReLU(),
+                Dense(1, activation='sigmoid')
+            ])
+            model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+            model.fit(
+                x_bit, y_bit,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_split=validation_split,
+                verbose=1,
+                shuffle=True,
+                callbacks=[stopper]
+            )
+            models.append((byte_idx, bit_idx, model))
+    return models
 
-# Setup: 
-# - Training: ~30K traces (e.g., 30 messages with 1000 traces each)
-# - Testing: ~10K traces (e.g., 10 messages with 1000 traces each)
-num_messages_train = 80
-N_per_message_train = 200
-num_messages_test  = 20
-N_per_message_test = 200
+def predict_models(models, X, s0_k, s1_k):
+    predictions_dict = {}
+    for byte_idx, bit_idx, model in models:
+        start0 = byte_idx * s0_k
+        end0 = start0 + s0_k
+        start1 = byte_idx * s1_k
+        end1 = start1 + s1_k
+        x_bit = X[:, start1:end1]
+        preds = (model.predict(x_bit, verbose=0) > 0.5).astype(int).ravel()
+        predictions_dict[byte_idx*8+bit_idx] = preds
+    return predictions_dict
 
-# Generate random 32-byte messages (each message is an array of 32 integers in [0,255])
-messages_train = [np.random.randint(low=0, high=256, size=32, dtype='int32')
-                  for _ in range(num_messages_train)]
-messages_test = [np.random.randint(low=0, high=256, size=32, dtype='int32')
-                 for _ in range(num_messages_test)]
+def results(predictions_dict, y_true, results_file):
+    with open(results_file, 'a', encoding='utf-8') as f:
+        f.write("Real Data Results S1:\n")
+        for bit_idx in sorted(predictions_dict.keys()):
+            preds = predictions_dict[bit_idx]
+            metric = BinaryAccuracy(threshold=0.5)
+            metric.update_state(y_true[:, bit_idx], preds)
+            acc = float(metric.result().numpy())
+            acc_line = f"b{bit_idx} acc={acc:.4f}"
+            f.write(acc_line + "\n")
+        f.write("**********\n")
 
-# Create training and test datasets (raw traces are used directly)
-X_train, y_train = create_samples_from_messages(messages_train, N_per_message_train, sigma=sigma)
-X_test,  y_test  = create_samples_from_messages(messages_test, N_per_message_test, sigma=sigma)
+def append_results(predictions_dict, y_true, sigma, k, n_train, npm_train, n_test, npm_test, results_file):
+    with open(results_file, 'a', encoding='utf-8') as f:
+        f.write(
+            f"sigma={sigma}\n"
+            f"k={k}\n"
+            f"train_msg={n_train}\tNpm_train={npm_train}\n"
+            f"test_msg={n_test}\tNpm_test={npm_test}\n"
+        )
 
-#Check the shapes of the generated datasets
-print("X_train shape:", X_train.shape)
-print("y_train shape:", y_train.shape)
-print("X_test shape:", X_test.shape)
-print("y_test shape:", y_test.shape)
-# ----------------------------
-# Deep Learning Model Definition
-# ----------------------------
+        for bit_idx in sorted(predictions_dict.keys()):
+            accs = []
+            for L in sorted(predictions_dict[bit_idx].keys()):
+                preds = predictions_dict[bit_idx][L]
+                metric = BinaryAccuracy(threshold=0.5)
+                metric.update_state(y_true[:, bit_idx], preds)
+                acc = float(metric.result().numpy())
+                accs.append((L, acc))
+            acc_line = f"b{bit_idx} " + " ".join([f"(L={L})={acc:.4f}" for L, acc in accs])
+            f.write(acc_line + "\n")
 
-def create_model_single_bit(input_dim, omega=1):
-    model = Sequential()
-    model.add(Input(shape=(input_dim,)))
-    model.add(BatchNormalization())
-    model.add(Dense(32 * (omega + 1), use_bias=False))
-    model.add(BatchNormalization())
-    model.add(ReLU())
-    model.add(Dense(2 ** (omega + 4), use_bias=False))
-    model.add(BatchNormalization())
-    model.add(ReLU())
-    model.add(Dense(2 ** (omega + 3), use_bias=False))
-    model.add(BatchNormalization())
-    model.add(ReLU())
-    model.add(Dense(1, activation='sigmoid'))
+        f.write("**********\n")
+    print(f"Results for sigma={sigma} appended.")
+
+def main():
+    sigma, k, num_messages_train, N_per_message_train, num_messages_test, N_per_message_test, num_bits, epochs, batch_size, validation_split, results_file = get_parameters()
+    omega = 1
+    msgs_train = generate_random_messages(num_messages_train)
+    msgs_test = generate_random_messages(num_messages_test)
     
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    return model
-
-# ----------------------------
-# Training the Models for Bit Recovery
-# ----------------------------
-
-N_train, input_dim = X_train.shape
-# y_train has shape (N_train, 256) where each row is the 256-bit message
-
-bit_models = []
-predictions_all_train = np.zeros_like(y_train)
-
-# Train a separate model for each of the 256 bits
-for bit_idx in range(256):
-    # Extract the label for the current bit (shape: (N_train, 1))
-    y_train_bit = y_train[:, bit_idx].reshape(-1, 1)
-    assert y_train_bit.shape == (N_train, 1)
-    # Create and train the model for this bit
-    clear_session()
-    model_bit = create_model_single_bit(input_dim=input_dim, omega=1)
-    model_bit.fit(
-        X_train, 
-        y_train_bit, 
-        epochs=10, 
-        batch_size=32, 
-        validation_split=0.2, 
-        verbose=1,
-        shuffle=True
-    )
-    
-    # Predict on the training set (for evaluation)
-    pred_bit = (model_bit.predict(X_train) > 0.5).astype(int).flatten()
-    predictions_all_train[:, bit_idx] = pred_bit
-    bit_models.append(model_bit)
-
-# ----------------------------
-# Combine Predictions for Final Message Reconstruction (Training)
-# ----------------------------
-
-# For demonstration, combine predictions of all training samples by averaging per bit.
-predicted_bits_final_train = (predictions_all_train.mean(axis=0) > 0.5).astype(int)
-
-# Compare against the first sample's label from the training set.
-first_sample_original_bits = y_train[0]
-correctness_mask = (predicted_bits_final_train == first_sample_original_bits)
-num_correct_bits = correctness_mask.sum()
-num_total_bits   = len(first_sample_original_bits)
-
-print("[Final Single-Message Reconstruction on Training Data]")
-print("Predicted bits: ", predicted_bits_final_train)
-print("Original bits (first sample):", first_sample_original_bits)
-print("Correctness per bit:", correctness_mask)
-print(f"Correct bits: {num_correct_bits}/{num_total_bits}")
-print(f"Bit error count: {num_total_bits - num_correct_bits}")
-
-# ----------------------------
-# Evaluation on Test Data
-# ----------------------------
-
-# For each bit, predict on the test set using the corresponding trained model.
-predictions_all_test = np.zeros((X_test.shape[0], 256), dtype=int)
-for bit_idx in range(256):
-    y_test_pred = (bit_models[bit_idx].predict(X_test) > 0.5).astype(int).flatten()
-    predictions_all_test[:, bit_idx] = y_test_pred
-
-# The test set contains multiple traces per test message.
-# Group the predictions by test message and perform a majority vote.
-# Assuming the samples are ordered such that the first N_per_message_test samples
-# correspond to the first test message, the next N_per_message_test samples to the second, etc.
-grouped_predictions = predictions_all_test.reshape((num_messages_test, N_per_message_test, 256))
-predicted_bits_final_test = (grouped_predictions.mean(axis=1) > 0.5).astype(int)
-
-# Similarly, group the ground-truth labels from y_test (all traces from the same message have identical labels)
-grouped_y_test = y_test.reshape((num_messages_test, N_per_message_test, 256))
-true_message_bits = grouped_y_test[:, 0, :]  # Take the label from the first trace for each message
-
-# Compute bit error counts for each test message.
-bit_errors_per_message = (predicted_bits_final_test != true_message_bits).sum(axis=1)
-average_bit_error = bit_errors_per_message.mean()
-
-print("\n[Evaluation on Test Data]")
-for i in range(num_messages_test):
-    print(f"Test Message {i+1}: Bit errors = {bit_errors_per_message[i]} out of 256")
-print(f"Average bit error per message: {average_bit_error} out of 256")
+    X_train, y_train = create_samples_from_messages(msgs_train, N_per_message_train, sigma, k)
+    X_test, y_test = create_samples_from_messages(msgs_test, N_per_message_test, sigma, k)
+    print(f"Training set shape: {X_train.shape}, Labels shape: {y_train.shape}")
+    print(f"Test set shape: {X_test.shape}, Labels shape: {y_test.shape}")
+    print(X_train)
+    print(y_train)
+if __name__ == '__main__':
+    main()
